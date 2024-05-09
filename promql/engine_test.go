@@ -34,6 +34,7 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/prometheus/prometheus/util/stats"
@@ -583,6 +584,160 @@ func TestSelectHintsSetCorrectly(t *testing.T) {
 			require.Equal(t, tc.expected, hintsRecorder.hints)
 		})
 	}
+}
+
+func TestMemoryReuseBugDemo(t *testing.T) {
+	var (
+		engine = NewEngine(EngineOpts{
+			MaxSamples: 100_000,
+			Timeout:    5 * time.Minute,
+		})
+
+		startTime = time.Now().Add(-1 * time.Hour).Truncate(time.Hour)
+
+		repeatingFH = &histogram.FloatHistogram{
+			Count: 300_000,
+		}
+
+		queryable = storage.QueryableFunc(func(mint, maxt int64) (storage.Querier, error) {
+			return &testQuerier{
+				series: newTestSeriesSet([]storage.Series{&testSeries{
+					lbls: labels.FromMap(map[string]string{
+						"__name__": "test_metric",
+					}),
+					samples: []HPoint{
+						{
+							T: startTime.UnixMilli(),
+							H: repeatingFH,
+						},
+						{
+							T: startTime.Add(2 * time.Minute).UnixMilli(),
+							H: repeatingFH,
+						},
+						{
+							T: startTime.Add(5 * time.Minute).UnixMilli(),
+							H: &histogram.FloatHistogram{Count: 600_000},
+						},
+						{
+							T: startTime.Add(5*time.Minute + 30*time.Second).UnixMilli(),
+							H: &histogram.FloatHistogram{Count: 750_000},
+						},
+					},
+				}}),
+			}, nil
+		})
+
+		// correct result calculated by storing a histogram copy instead of returned pointer in engine.go:2330
+		expectedCounts = []int64{0, 0, 0, 1000, 2142, 2142, 1000}
+	)
+
+	q, err := engine.NewRangeQuery(context.Background(), queryable, nil, `rate(test_metric[5m])`, startTime, startTime.Add(8*time.Minute), 1*time.Minute)
+	require.NoError(t, err)
+
+	result := q.Exec(context.Background())
+	mat := result.Value.(Matrix)
+	require.Len(t, mat, 1)
+
+	var actualCounts []int64
+	for _, series := range mat[0].Histograms {
+		actualCounts = append(actualCounts, int64(series.H.Count))
+	}
+	require.Equal(t, expectedCounts, actualCounts)
+}
+
+type testSeriesSet struct {
+	idx    int
+	series []storage.Series
+}
+
+func (s *testSeriesSet) Next() bool                        { s.idx++; return s.idx < len(s.series) }
+func (s *testSeriesSet) At() storage.Series                { return s.series[s.idx] }
+func (s *testSeriesSet) Err() error                        { return nil }
+func (s *testSeriesSet) Warnings() annotations.Annotations { return nil }
+
+type testSeries struct {
+	lbls    []labels.Label
+	samples []HPoint
+}
+
+type testIterator struct {
+	s *testSeries
+	i int
+}
+
+func (i *testIterator) Next() chunkenc.ValueType {
+	i.i++
+	if i.i < len(i.s.samples) {
+		return chunkenc.ValFloatHistogram
+	}
+	return chunkenc.ValNone
+}
+
+func (i *testIterator) Seek(t int64) chunkenc.ValueType {
+	if 0 <= i.i && t <= i.s.samples[i.i].T {
+		return chunkenc.ValFloatHistogram
+	}
+
+	for i.Next() != chunkenc.ValNone {
+		if i.AtT() < t {
+			continue
+		}
+		return chunkenc.ValFloatHistogram
+	}
+	return chunkenc.ValNone
+}
+
+func (i *testIterator) At() (int64, float64) {
+	panic("implement me")
+}
+
+func (i *testIterator) AtHistogram(h *histogram.Histogram) (int64, *histogram.Histogram) {
+	panic("implement me")
+}
+
+func (i *testIterator) AtFloatHistogram(floatHistogram *histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	return i.s.samples[i.i].T, i.s.samples[i.i].H
+}
+
+func (i *testIterator) AtT() int64 {
+	return i.s.samples[i.i].T
+}
+
+func (i *testIterator) Err() error {
+	return nil
+}
+
+func (s *testSeries) Labels() labels.Labels {
+	return labels.New(s.lbls...)
+}
+
+func (s *testSeries) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
+	return &testIterator{s: s, i: -1}
+}
+
+// TestSeriesSet returns a mock series set.
+func newTestSeriesSet(series []storage.Series) storage.SeriesSet {
+	return &testSeriesSet{idx: -1, series: series}
+}
+
+type testQuerier struct {
+	series storage.SeriesSet
+}
+
+func (s *testQuerier) LabelValues(_ context.Context, _ string, _ ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	panic("implement me")
+}
+
+func (s *testQuerier) LabelNames(_ context.Context, _ ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	panic("implement me")
+}
+
+func (s *testQuerier) Close() error {
+	return nil
+}
+
+func (s *testQuerier) Select(ctx context.Context, _ bool, _ *storage.SelectHints, _ ...*labels.Matcher) storage.SeriesSet {
+	return s.series
 }
 
 func TestEngineShutdown(t *testing.T) {
