@@ -1635,6 +1635,10 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 				inMatrix[0].Histograms = histograms
 				enh.Ts = ts
 				// Make the function call.
+				fmt.Printf("Input into function:\n")
+				for _, h := range histograms {
+					fmt.Printf(" => [%s] %.2f (%p)\n", time.UnixMilli(h.T), h.H.Count, h.H)
+				}
 				outVec, annos := call(inArgs, e.Args, enh)
 				warnings.Merge(annos)
 				ev.samplesStats.IncrementSamplesAtStep(step, int64(len(floats)+totalHPointSize(histograms)))
