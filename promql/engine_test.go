@@ -696,12 +696,7 @@ func (i *testIterator) AtHistogram(h *histogram.Histogram) (int64, *histogram.Hi
 }
 
 func (i *testIterator) AtFloatHistogram(fh *histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
-	if fh == nil {
-		return i.s.samples[i.i].T, i.s.samples[i.i].H.Copy()
-	} else {
-		i.s.samples[i.i].H.CopyTo(fh)
-		return i.s.samples[i.i].T, fh
-	}
+	return i.s.samples[i.i].T, i.s.samples[i.i].H
 }
 
 func (i *testIterator) AtT() int64 {
